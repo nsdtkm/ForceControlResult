@@ -1,26 +1,9 @@
-import dash
-from dash import dcc, html, Input, Output, State, dash_table, callback_context
+import streamlit as st
 import pandas as pd
 import io
 import base64
 import plotly.graph_objects as go
-import dash_bootstrap_components as dbc  # dash-bootstrap-componentsをインポート
-
-# Dashアプリケーションの初期化
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])  # Bootstrapテーマを使用
-
-# レイアウトの定義
-app.layout = html.Div([
-    html.H1("測定データ解析ダッシュボード", className="text-center"),
-    dbc.Row([
-        dbc.Col(dcc.Upload(id="upload-data", children=html.Button("ファイルをアップロード"), multiple=False), width=12),
-    ], justify="center"),
-    html.Div(id="file-name", className="text-center mt-3"),
-    dbc.Row([
-        dbc.Col(dcc.Dropdown(id="table-dropdown", placeholder="Tableを選択", multi=False), width=6)
-    ], justify="center"),
-    html.Div(id="scatter-plots")
-])
+import plotly.express as px
 
 # 規格範囲の判定関数
 def get_limits(target):
@@ -32,10 +15,13 @@ def get_limits(target):
 
 # データ処理関数
 def process_data(contents):
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-    df = pd.read_csv(io.StringIO(decoded.decode('utf-8')), delimiter="\t")
+    # バイナリデータ（bytes）をデコード
+    decoded = contents.decode('utf-8')  # 文字列としてデコード
 
+    # Pandasで読み込み
+    df = pd.read_csv(io.StringIO(decoded), delimiter="\t")
+
+    # 必要なカラムを処理
     df = df[['Table', 'Head', 'Target', 'Result']]
     df['Head'] = df['Head'] + 1  # 0スタートを1スタートに
     df['Table'].replace(0, 'A', inplace=True)
@@ -45,41 +31,10 @@ def process_data(contents):
 
     return df
 
-# コールバック：ファイルアップロードとTable選択時にデータ更新
-@app.callback(
-    [Output("file-name", "children"),
-     Output("table-dropdown", "options"),
-     Output("table-dropdown", "value"),
-     Output("scatter-plots", "children")],
-    [Input("upload-data", "contents"),
-     Input("table-dropdown", "value")],
-    prevent_initial_call=True
-)
-def update_dashboard(contents, selected_table):
-    global df
-
-    # コールバックのトリガーを判定
-    ctx = callback_context
-    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
-
-    if trigger_id == "upload-data":
-        if contents is None:
-            return "", [], None, []
-        df = process_data(contents)
-
-        table_options = [{"label": f"Table {t}", "value": t} for t in df["Table"].unique()]
-        default_table = df["Table"].unique()[0]  # 最初のTableをデフォルト選択
-        return "ファイル: " + contents[:30] + "...", table_options, default_table, update_plots(default_table)
-
-    elif trigger_id == "table-dropdown":
-        return dash.no_update, dash.no_update, dash.no_update, update_plots(selected_table)
-
-    return dash.no_update
-
 # 統計情報作成関数
-def calculate_statistics(selected_table):
+def calculate_statistics(df, selected_table):
     if selected_table is None:
-        return []
+        return pd.DataFrame()
 
     filtered_df = df[df["Table"] == selected_table]
     stats_list = []
@@ -106,7 +61,7 @@ def calculate_statistics(selected_table):
     return stats_df
 
 # グラフ作成関数
-def update_plots(selected_table):
+def update_plots(df, selected_table):
     if selected_table is None:
         return []
 
@@ -137,38 +92,31 @@ def update_plots(selected_table):
             template="plotly_white"
         )
 
-        plots.append(dcc.Graph(figure=fig))
+        plots.append(fig)
 
-    # 4x2のレイアウトでグラフを配置
-    cols = []
-    for i in range(0, len(plots), 4):
-        cols.append(dbc.Row([dbc.Col(plot, width=3) for plot in plots[i:i + 4]]))  # 横4個ずつ表示
+    return plots
 
-    # 統計情報のテーブル作成
-    stats_df = calculate_statistics(selected_table)
+# Streamlit UI設定
+st.title("測定データ解析ダッシュボード")
 
-    # テーブルの作成
-    table_list = []
-    for head in range(1, 9):  # Head1〜Head8
-        head_stats = stats_df[stats_df["Head"] == head]
-        table = dash_table.DataTable(
-            id=f"statistics-table-head-{head}",
-            columns=[
-                {"name": col, "id": col} for col in ["Target", "Mean", "Max", "Min", "Range", "3σ"]
-            ],
-            data=head_stats[["Target", "Mean", "Max", "Min", "Range", "3σ"]].to_dict("records"),
-            style_table={"height": "300px", "overflowY": "auto"},
-            style_cell={'textAlign': 'center'},
-            style_header={'fontWeight': 'bold'}
-        )
-        table_list.append(dbc.Col(table, width=3, style={'margin': '5px'}))  # 横4個ずつ表示
+# ファイルアップロード
+uploaded_file = st.file_uploader("ファイルをアップロード", type=["csv", "txt"])
+if uploaded_file is not None:
+    # ファイルを処理
+    df = process_data(uploaded_file.getvalue())
 
-    # 4x2のレイアウトでテーブルを表示
-    table_rows = []
-    for i in range(0, len(table_list), 4):
-        table_rows.append(dbc.Row(table_list[i:i + 4]))
+    # Tableの選択
+    table_options = df["Table"].unique()
+    selected_table = st.selectbox("Tableを選択", table_options)
 
-    return cols + table_rows
+    # 統計情報の表示
+    stats_df = calculate_statistics(df, selected_table)
+    st.subheader(f"統計情報 ({selected_table})")
+    st.dataframe(stats_df)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+    # グラフの表示
+    st.subheader(f"グラフ ({selected_table})")
+    plots = update_plots(df, selected_table)
+    for fig in plots:
+        st.plotly_chart(fig)
+
