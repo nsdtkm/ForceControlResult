@@ -1,19 +1,10 @@
-import dash
-from dash import dcc, html, Input, Output, State, dash_table, callback_context
+import streamlit as st
 import pandas as pd
 import io
-import base64
 import plotly.graph_objects as go
-
-app = dash.Dash(__name__)
-
-app.layout = html.Div([
-    html.H1("測定データ解析ダッシュボード"),
-    dcc.Upload(id="upload-data", children=html.Button("ファイルをアップロード"), multiple=False),
-    html.Div(id="file-name"),
-    dcc.Dropdown(id="table-dropdown", placeholder="Tableを選択", multi=False),
-    html.Div(id="scatter-plots")
-])
+from streamlit.column_config import Column
+# ページ設定（ワイドレイアウト）
+st.set_page_config(layout="wide")
 
 # 規格範囲の判定関数
 def get_limits(target):
@@ -25,52 +16,54 @@ def get_limits(target):
 
 # データ処理関数
 def process_data(contents):
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-    df = pd.read_csv(io.StringIO(decoded.decode('utf-8')), delimiter="\t")
+    decoded = contents.decode('utf-8')
+    df = pd.read_csv(io.StringIO(decoded), delimiter="\t")
 
     df = df[['Table', 'Head', 'Target', 'Result']]
+    df['Head'] = df['Head'] + 1
+    df['Table'].replace(0, 'A', inplace=True)
+    df['Table'].replace(1, 'B', inplace=True)
     df["Lower_Limit"], df["Upper_Limit"] = zip(*df["Target"].map(get_limits))
     df["Index"] = df.groupby(["Table", "Head", "Target"]).cumcount() + 1  # 測定回数のインデックス
 
     return df
 
-# コールバック：ファイルアップロードとTable選択時にデータ更新
-@app.callback(
-    [Output("file-name", "children"),
-     Output("table-dropdown", "options"),
-     Output("table-dropdown", "value"),
-     Output("scatter-plots", "children")],
-    [Input("upload-data", "contents"),
-     Input("table-dropdown", "value")],
-    prevent_initial_call=True
-)
-def update_dashboard(contents, selected_table):
-    global df
+# 異常値の文字色を変更する関数
+def color_out_of_limits(val, lower, upper):
+    """
+    Resultが許容範囲を超えた場合、赤色にする
+    """
+    if val < lower or val > upper:
+        return 'color: red; font-weight: bold'
+    return ''
 
-    # コールバックのトリガーを判定
-    ctx = callback_context
-    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
+# 統計情報作成関数
+def calculate_statistics(df):
+    stats_list = []
 
-    if trigger_id == "upload-data":
-        if contents is None:
-            return "", [], None, []
-        df = process_data(contents)
+    for (head, target), group in df.groupby(["Head", "Target"]):
+        mean = group["Result"].mean()
+        max_value = group["Result"].max()
+        min_value = group["Result"].min()
+        range_value = max_value - min_value
+        sigma_3 = group["Result"].std() * 3
 
-        table_options = [{"label": f"Table {t}", "value": t} for t in df["Table"].unique()]
-        default_table = df["Table"].unique()[0]  # 最初のTableをデフォルト選択
-        return "ファイル: " + contents[:30] + "...", table_options, default_table, update_plots(default_table)
+        stats_list.append({
+            "Head": head,
+            "Target": target,
+            "Mean": mean,
+            "Max": max_value,
+            "Min": min_value,
+            "Range": range_value,
+            "3σ": sigma_3,
+            "Lower_Limit": get_limits(target)[0],
+            "Upper_Limit": get_limits(target)[1]
+        })
 
-    elif trigger_id == "table-dropdown":
-        return dash.no_update, dash.no_update, dash.no_update, update_plots(selected_table)
-
-    return dash.no_update
+    return pd.DataFrame(stats_list)
 
 # グラフ作成関数
-def update_plots(selected_table):
-    if selected_table is None:
-        return []
-
+def update_plots(df, selected_table):
     filtered_df = df[df["Table"] == selected_table]
     heads = sorted(filtered_df["Head"].unique())
 
@@ -78,39 +71,102 @@ def update_plots(selected_table):
     for head in heads:
         head_df = filtered_df[filtered_df["Head"] == head]
 
+        # 測定結果をプロットする散布図
         fig = go.Figure()
 
         for target in head_df["Target"].unique():
             subset = head_df[head_df["Target"] == target]
-            # lower, upper = subset["Lower_Limit"].iloc[0], subset["Upper_Limit"].iloc[0]
 
             fig.add_trace(go.Scatter(
-                x=subset["Index"], y=subset["Result"],
+                x=subset["Index"], 
+                y=subset["Result"],
                 mode="markers", name=f"Target {target}",
-                marker=dict(size=3)
+                marker=dict(size=4)
             ))
 
-            # fig.add_trace(go.Scatter(
-            #     x=[subset["Index"].min(), subset["Index"].max()],
-            #     y=[lower, lower], mode="lines",
-            #     name=f"Lower {target}", line=dict(color="red", dash="dash")
-            # ))
-            # fig.add_trace(go.Scatter(
-            #     x=[subset["Index"].min(), subset["Index"].max()],
-            #     y=[upper, upper], mode="lines",
-            #     name=f"Upper {target}", line=dict(color="red", dash="dash")
-            # ))
-
+        fig.update_yaxes(range=(0, 40))
         fig.update_layout(
             title=f"Head {head} の測定データ",
             xaxis_title="測定回数",
             yaxis_title="実測値 (Result)",
-            template="plotly_white"
+            template="plotly_white",
+            showlegend=False  # 凡例は表示しない
         )
 
-        plots.append(dcc.Graph(figure=fig))
+        plots.append(fig)
 
     return plots
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# 箱ひげ図作成関数
+def update_boxplot(df, selected_table, selected_head):
+    filtered_df = df[(df["Table"] == selected_table) & (df["Head"] == selected_head)]
+
+    fig = go.Figure()
+
+    for target in filtered_df["Target"].unique():
+        subset = filtered_df[filtered_df["Target"] == target]
+
+        # 箱ひげ図を作成
+        fig.add_trace(go.Box(
+            y=subset["Result"],
+            x=subset["Target"],
+            name=f"Head {selected_head} Target {target}",
+            boxmean=True  # 箱ひげ図の中央値を表示
+        ))
+
+    fig.update_layout(
+        title=f"Head {selected_head} の箱ひげ図",
+        xaxis_title="Target",
+        yaxis_title="Result",
+        template="plotly_white",
+        showlegend=False
+    )
+
+    return fig
+
+# Streamlit UI設定
+st.title("荷重測定結果ビュワー")
+
+# ファイルアップロード
+uploaded_file = st.file_uploader("ファイルをアップロード", type=["csv", "txt"])
+if uploaded_file is not None:
+    df = process_data(uploaded_file.getvalue())
+
+    # Tableの選択
+    table_options = df["Table"].unique()
+    selected_table = st.selectbox("Tableを選択", table_options)
+
+    # Headの選択
+    filtered_df = df[df["Table"] == selected_table]
+    head_options = sorted(filtered_df["Head"].unique())
+    selected_head = st.selectbox("Headを選択", head_options)
+
+    # 統計情報の表示（選択したHeadのみ）
+    stats_df = calculate_statistics(filtered_df)
+    stats_df = stats_df[stats_df["Head"] == selected_head].drop(columns=["Head"])  # Head列を削除
+    # 文字色を適用するためのスタイル関数
+    def highlight_result(s):
+        """
+        Resultの値が許容範囲を超えている場合に赤色にする
+        """
+        return [color_out_of_limits(val, lower, upper) for val, lower, upper in zip(s, stats_df["Lower_Limit"], stats_df["Upper_Limit"])]
+    # 統計情報と箱ひげ図を横並びに表示
+    col1, col2 = st.columns([2, 3])  # 2:3の割合でカラムを作成
+
+    with col1:
+        st.subheader(f"統計情報 (Table: {selected_table}, Head: {selected_head})")
+        st.dataframe(stats_df.style.apply(highlight_result, subset=["Max", "Min"]), use_container_width=True)
+
+    with col2:
+        st.subheader(f"箱ひげ図 ({selected_table}, Head: {selected_head})")
+        boxplot_fig = update_boxplot(df, selected_table, selected_head)
+        st.plotly_chart(boxplot_fig, use_container_width=True)
+
+    # 測定結果の散布図の表示（4x2レイアウト）
+    st.subheader(f"測定結果グラフ ({selected_table})")
+    plots = update_plots(df, selected_table)
+
+    cols = st.columns(4)  # 4列のカラムを作成
+    for i, fig in enumerate(plots):
+        with cols[i % 4]:  # 4列ごとに表示
+            st.plotly_chart(fig, use_container_width=True)
