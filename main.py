@@ -4,14 +4,21 @@ import pandas as pd
 import io
 import base64
 import plotly.graph_objects as go
+import dash_bootstrap_components as dbc  # dash-bootstrap-componentsをインポート
 
-app = dash.Dash(__name__)
+# Dashアプリケーションの初期化
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])  # Bootstrapテーマを使用
 
+# レイアウトの定義
 app.layout = html.Div([
-    html.H1("測定データ解析ダッシュボード"),
-    dcc.Upload(id="upload-data", children=html.Button("ファイルをアップロード"), multiple=False),
-    html.Div(id="file-name"),
-    dcc.Dropdown(id="table-dropdown", placeholder="Tableを選択", multi=False),
+    html.H1("測定データ解析ダッシュボード", className="text-center"),
+    dbc.Row([
+        dbc.Col(dcc.Upload(id="upload-data", children=html.Button("ファイルをアップロード"), multiple=False), width=12),
+    ], justify="center"),
+    html.Div(id="file-name", className="text-center mt-3"),
+    dbc.Row([
+        dbc.Col(dcc.Dropdown(id="table-dropdown", placeholder="Tableを選択", multi=False), width=6)
+    ], justify="center"),
     html.Div(id="scatter-plots")
 ])
 
@@ -30,6 +37,9 @@ def process_data(contents):
     df = pd.read_csv(io.StringIO(decoded.decode('utf-8')), delimiter="\t")
 
     df = df[['Table', 'Head', 'Target', 'Result']]
+    df['Head'] = df['Head'] + 1  # 0スタートを1スタートに
+    df['Table'].replace(0, 'A', inplace=True)
+    df['Table'].replace(1, 'B', inplace=True)
     df["Lower_Limit"], df["Upper_Limit"] = zip(*df["Target"].map(get_limits))
     df["Index"] = df.groupby(["Table", "Head", "Target"]).cumcount() + 1  # 測定回数のインデックス
 
@@ -66,6 +76,35 @@ def update_dashboard(contents, selected_table):
 
     return dash.no_update
 
+# 統計情報作成関数
+def calculate_statistics(selected_table):
+    if selected_table is None:
+        return []
+
+    filtered_df = df[df["Table"] == selected_table]
+    stats_list = []
+
+    for (table, head, target), group in filtered_df.groupby(["Table", "Head", "Target"]):
+        mean = group["Result"].mean()
+        max_value = group["Result"].max()
+        min_value = group["Result"].min()
+        range_value = max_value - min_value
+        sigma_3 = group["Result"].std() * 3
+
+        stats_list.append({
+            "Table": table,
+            "Head": head,
+            "Target": target,
+            "Mean": round(mean,2),
+            "Max": round(max_value,2),
+            "Min": round(min_value,2),
+            "Range": round(range_value,2),
+            "3σ": round(sigma_3,2)
+        })
+
+    stats_df = pd.DataFrame(stats_list)
+    return stats_df
+
 # グラフ作成関数
 def update_plots(selected_table):
     if selected_table is None:
@@ -82,24 +121,14 @@ def update_plots(selected_table):
 
         for target in head_df["Target"].unique():
             subset = head_df[head_df["Target"] == target]
-            # lower, upper = subset["Lower_Limit"].iloc[0], subset["Upper_Limit"].iloc[0]
 
             fig.add_trace(go.Scatter(
                 x=subset["Index"], y=subset["Result"],
                 mode="markers", name=f"Target {target}",
                 marker=dict(size=3)
             ))
-
-            # fig.add_trace(go.Scatter(
-            #     x=[subset["Index"].min(), subset["Index"].max()],
-            #     y=[lower, lower], mode="lines",
-            #     name=f"Lower {target}", line=dict(color="red", dash="dash")
-            # ))
-            # fig.add_trace(go.Scatter(
-            #     x=[subset["Index"].min(), subset["Index"].max()],
-            #     y=[upper, upper], mode="lines",
-            #     name=f"Upper {target}", line=dict(color="red", dash="dash")
-            # ))
+            fig.update_yaxes(range=(0, 40))
+            fig.update_layout(showlegend=False)
 
         fig.update_layout(
             title=f"Head {head} の測定データ",
@@ -110,7 +139,36 @@ def update_plots(selected_table):
 
         plots.append(dcc.Graph(figure=fig))
 
-    return plots
+    # 4x2のレイアウトでグラフを配置
+    cols = []
+    for i in range(0, len(plots), 4):
+        cols.append(dbc.Row([dbc.Col(plot, width=3) for plot in plots[i:i + 4]]))  # 横4個ずつ表示
+
+    # 統計情報のテーブル作成
+    stats_df = calculate_statistics(selected_table)
+
+    # テーブルの作成
+    table_list = []
+    for head in range(1, 9):  # Head1〜Head8
+        head_stats = stats_df[stats_df["Head"] == head]
+        table = dash_table.DataTable(
+            id=f"statistics-table-head-{head}",
+            columns=[
+                {"name": col, "id": col} for col in ["Target", "Mean", "Max", "Min", "Range", "3σ"]
+            ],
+            data=head_stats[["Target", "Mean", "Max", "Min", "Range", "3σ"]].to_dict("records"),
+            style_table={"height": "300px", "overflowY": "auto"},
+            style_cell={'textAlign': 'center'},
+            style_header={'fontWeight': 'bold'}
+        )
+        table_list.append(dbc.Col(table, width=3, style={'margin': '5px'}))  # 横4個ずつ表示
+
+    # 4x2のレイアウトでテーブルを表示
+    table_rows = []
+    for i in range(0, len(table_list), 4):
+        table_rows.append(dbc.Row(table_list[i:i + 4]))
+
+    return cols + table_rows
 
 if __name__ == '__main__':
     app.run(debug=True)
